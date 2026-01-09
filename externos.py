@@ -8,6 +8,9 @@ import streamlit as st
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta, timezone
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 
 # =========================
@@ -217,6 +220,207 @@ def get_connection():
 
 
 # =========================
+# Envio de Email
+# =========================
+
+def buscar_emails_monitores_do_estudo(estudo_id: int, excluir_email: str = None):
+    """
+    Busca os emails dos monitores do estudo.
+    Opcionalmente exclui um email específico (ex: o gerente médico que fez a avaliação).
+    Retorna uma lista de emails únicos.
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Busca apenas monitores do estudo
+        cursor.execute(
+            """
+            SELECT DISTINCT monitor_email
+            FROM estudo_monitores
+            WHERE estudo_id = %s AND monitor_email IS NOT NULL AND monitor_email != ''
+            """,
+            (estudo_id,),
+        )
+        monitores = [row['monitor_email'].lower() for row in cursor.fetchall() if row['monitor_email']]
+
+        # Remove o email a ser excluído (se fornecido)
+        if excluir_email:
+            excluir_email_lower = excluir_email.lower()
+            monitores = [e for e in monitores if e != excluir_email_lower]
+
+        return monitores
+
+    except Exception as e:
+        print(f"Erro ao buscar destinatários: {e}")
+        return []
+    finally:
+        try:
+            cursor.close()
+            conn.close()
+        except Exception:
+            pass
+
+
+def enviar_email_avaliacao(
+    estudo_id: int,
+    estudo_codigo: str,
+    estudo_nome: str,
+    numero_desvio: int,
+    avaliacao: str,
+    gerente_nome: str,
+    gerente_email: str
+):
+    """
+    Envia email notificando sobre a avaliação do gerente médico.
+    Envia apenas para monitores do estudo (excluindo o gerente médico).
+    """
+    try:
+        # Buscar destinatários (apenas monitores, excluindo o gerente médico)
+        destinatarios = buscar_emails_monitores_do_estudo(estudo_id, excluir_email=gerente_email)
+        if not destinatarios:
+            print("Nenhum destinatário encontrado para enviar email")
+            return True  # Não é erro, apenas não há destinatários
+
+        # Configurações de email
+        email_config = st.secrets.get("email", {})
+        smtp_server = email_config.get("smtp_server")
+        smtp_port = email_config.get("smtp_port", 587)
+        sender = email_config.get("sender")
+        password = email_config.get("password")
+
+        if not all([smtp_server, sender, password]):
+            print("Configurações de email incompletas no secrets.toml")
+            return False
+
+        # Formatar data/hora atual
+        data_atual = datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y às %H:%M")
+
+        # Assunto do email
+        assunto = f"[Avaliação GM] {estudo_codigo} - Desvio {numero_desvio}"
+
+        # Corpo do email em HTML (layout azul)
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+        </head>
+        <body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
+            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f5f5f5; padding: 30px 0;">
+                <tr>
+                    <td align="center">
+                        <table width="600" cellpadding="0" cellspacing="0" style="background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); overflow: hidden;">
+
+                            <!-- Header -->
+                            <tr>
+                                <td style="background: linear-gradient(135deg, #1976D2 0%, #1565C0 100%); padding: 30px 40px; text-align: center;">
+                                    <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 600;">
+                                        🩺 Avaliação do Gerente Médico
+                                    </h1>
+                                    <p style="margin: 10px 0 0; color: rgba(255,255,255,0.9); font-size: 14px;">
+                                        Portal Pesquisa Clínica
+                                    </p>
+                                </td>
+                            </tr>
+
+                            <!-- Content -->
+                            <tr>
+                                <td style="padding: 40px;">
+
+                                    <!-- Info Cards -->
+                                    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 30px;">
+                                        <tr>
+                                            <td style="padding: 15px; background-color: #f8f9fa; border-radius: 8px; border-left: 4px solid #1976D2;">
+                                                <table width="100%" cellpadding="0" cellspacing="0">
+                                                    <tr>
+                                                        <td width="50%" style="padding: 8px 0;">
+                                                            <span style="color: #666; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Estudo</span><br>
+                                                            <span style="color: #333; font-size: 16px; font-weight: 600;">{estudo_codigo}</span><br>
+                                                            <span style="color: #666; font-size: 13px;">{estudo_nome}</span>
+                                                        </td>
+                                                        <td width="50%" style="padding: 8px 0; text-align: right;">
+                                                            <span style="color: #666; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Desvio ID</span><br>
+                                                            <span style="color: #1976D2; font-size: 24px; font-weight: 700;">{numero_desvio}</span>
+                                                        </td>
+                                                    </tr>
+                                                </table>
+                                            </td>
+                                        </tr>
+                                    </table>
+
+                                    <!-- Meta Info -->
+                                    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom: 25px;">
+                                        <tr>
+                                            <td style="padding: 10px 0; border-bottom: 1px solid #eee;">
+                                                <span style="color: #999; font-size: 13px;">🩺 Avaliado por:</span>
+                                                <span style="color: #333; font-size: 14px; font-weight: 500; margin-left: 10px;">{gerente_nome}</span>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td style="padding: 10px 0;">
+                                                <span style="color: #999; font-size: 13px;">📅 Data/Hora:</span>
+                                                <span style="color: #333; font-size: 14px; font-weight: 500; margin-left: 10px;">{data_atual}</span>
+                                            </td>
+                                        </tr>
+                                    </table>
+
+                                    <!-- Avaliação -->
+                                    <h3 style="margin: 0 0 15px; color: #333; font-size: 16px; font-weight: 600;">
+                                        📋 Avaliação do Gerente Médico
+                                    </h3>
+                                    <div style="background-color: #e3f2fd; border-radius: 8px; padding: 20px; border-left: 4px solid #1976D2;">
+                                        <p style="margin: 0; color: #333; font-size: 14px; line-height: 1.6; white-space: pre-wrap;">{avaliacao or '-'}</p>
+                                    </div>
+
+                                </td>
+                            </tr>
+
+                            <!-- Footer -->
+                            <tr>
+                                <td style="background-color: #f8f9fa; padding: 25px 40px; text-align: center; border-top: 1px solid #eee;">
+                                    <p style="margin: 0; color: #999; font-size: 12px;">
+                                        Este é um email automático do sistema Portal Pesquisa Clínica.<br>
+                                        Por favor, não responda a este email.
+                                    </p>
+                                    <p style="margin: 15px 0 0; color: #1976D2; font-size: 11px; font-weight: 600;">
+                                        © {datetime.now().year} Synvia
+                                    </p>
+                                </td>
+                            </tr>
+
+                        </table>
+                    </td>
+                </tr>
+            </table>
+        </body>
+        </html>
+        """
+
+        # Enviar para cada destinatário
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender, password)
+
+            for destinatario in destinatarios:
+                msg = MIMEMultipart('alternative')
+                msg['Subject'] = assunto
+                msg['From'] = sender
+                msg['To'] = destinatario
+
+                msg.attach(MIMEText(html_body, 'html'))
+
+                server.sendmail(sender, destinatario, msg.as_string())
+
+        print(f"Email de avaliação GM enviado para {len(destinatarios)} destinatário(s)")
+        return True
+
+    except Exception as e:
+        print(f"Erro ao enviar email: {e}")
+        return False
+
+
+# =========================
 # Autenticação do Gerente Médico
 # =========================
 
@@ -225,13 +429,15 @@ def login_screen():
     # Seletor de idioma na tela de login
     col_lang, _ = st.columns([1, 4])
     with col_lang:
-        idioma_opcoes = {"Português": "pt", "English": "en"}
+        idioma_opcoes = {"🌐 Português": "pt", "🌐 English": "en"}
         idioma_atual = st.session_state.get("language", "pt")
+        opcao_atual = "🌐 Português" if idioma_atual == "pt" else "🌐 English"
         novo_idioma = st.selectbox(
-            "🌐",
+            "Idioma",
             options=list(idioma_opcoes.keys()),
-            index=list(idioma_opcoes.values()).index(idioma_atual),
+            index=list(idioma_opcoes.keys()).index(opcao_atual),
             key="login_language_selector",
+            label_visibility="collapsed",
         )
         if idioma_opcoes[novo_idioma] != idioma_atual:
             st.session_state["language"] = idioma_opcoes[novo_idioma]
@@ -309,7 +515,7 @@ def carregar_estudos_do_gerente(_email: str):
             FROM estudos e
             INNER JOIN estudo_gerente_medico egm ON e.id = egm.estudo_id
             INNER JOIN gerentes_medicos gm ON gm.id = egm.gerente_medico_id
-            LEFT JOIN desvios d ON d.estudo_id = e.id
+            LEFT JOIN desvios d ON d.estudo_id = e.id AND d.deleted_at IS NULL
             WHERE LOWER(gm.email) = LOWER(%s)
               AND e.status = 'ativo'
             GROUP BY e.id, e.codigo, e.nome
@@ -346,7 +552,7 @@ def carregar_metricas_gerente(_email: str):
             FROM estudos e
             INNER JOIN estudo_gerente_medico egm ON e.id = egm.estudo_id
             INNER JOIN gerentes_medicos gm ON gm.id = egm.gerente_medico_id
-            LEFT JOIN desvios d ON d.estudo_id = e.id
+            LEFT JOIN desvios d ON d.estudo_id = e.id AND d.deleted_at IS NULL
             WHERE LOWER(gm.email) = LOWER(%s)
               AND e.status = 'ativo'
             """,
@@ -455,13 +661,14 @@ def carregar_desvios_do_estudo(estudo_id: int, filtro_status: str = "Pendentes")
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # Query base - todos os campos do formulário
+        # Query base - todos os campos do formulário (exclui soft deleted)
         query = """
             SELECT
                 *,
                 xmin AS row_version
             FROM desvios
             WHERE estudo_id = %s
+              AND deleted_at IS NULL
         """
 
         params = [estudo_id]
@@ -496,12 +703,13 @@ def limpar_cache():
     carregar_desvios_do_estudo.clear()
 
 
-def salvar_avaliacao(desvio_id, estudo_id, avaliacao, row_version, valor_antigo, status_antigo):
+def salvar_avaliacao(desvio: dict, estudo_id: int, avaliacao: str, row_version, valor_antigo: str, status_antigo: str):
     """
     Salva a avaliação do gerente médico e atualiza o status para 'Avaliado'.
-    Registra as alterações no log.
+    Registra as alterações no log e envia email de notificação.
     """
     gerente_nome = st.session_state["gerente_nome"]
+    desvio_id = desvio["id"]
 
     try:
         conn = get_connection()
@@ -550,6 +758,21 @@ def salvar_avaliacao(desvio_id, estudo_id, avaliacao, row_version, valor_antigo,
         # Limpar cache após salvar com sucesso
         limpar_cache()
 
+        # 4. Enviar email de notificação (em background, não bloqueia)
+        try:
+            enviar_email_avaliacao(
+                estudo_id=estudo_id,
+                estudo_codigo=st.session_state.get("estudo_codigo", ""),
+                estudo_nome=st.session_state.get("estudo_nome", ""),
+                numero_desvio=desvio.get("numero_desvio_estudo", 0),
+                avaliacao=avaliacao,
+                gerente_nome=gerente_nome,
+                gerente_email=st.session_state.get("gerente_email", "")
+            )
+        except Exception as email_error:
+            # Não falha a operação se o email não for enviado
+            print(f"Aviso: Email não enviado - {email_error}")
+
         return True, "sucesso"
 
     except Exception as e:
@@ -560,6 +783,24 @@ def salvar_avaliacao(desvio_id, estudo_id, avaliacao, row_version, valor_antigo,
             conn.close()
         except Exception:
             pass
+
+
+def get_campo_traduzido(desvio: dict, campo: str) -> str:
+    """
+    Retorna o valor do campo traduzido baseado no idioma selecionado.
+    Para campos de selectbox que possuem versão _en, usa a coluna apropriada.
+
+    Campos com tradução: status, formulario_status, importancia, recorrencia,
+                         escopo, atendeu_prazos_report, formulario_arquivado
+    """
+    lang = st.session_state.get("language", "pt")
+
+    if lang == "en":
+        campo_en = f"{campo}_en"
+        if campo_en in desvio and desvio.get(campo_en):
+            return desvio.get(campo_en) or '-'
+
+    return desvio.get(campo) or '-'
 
 
 def formatar_data(data_raw):
@@ -596,25 +837,23 @@ def exibir_detalhes_desvio(desvio):
     with col2:
         with st.container(border=True):
             st.caption(t("Status"))
-            status = desvio['status']
-            if status == 'Avaliado':
-                st.success(t("Avaliado"))
+            status = get_campo_traduzido(desvio, 'status')
+            if status.lower() in ['avaliado', 'evaluated']:
+                st.success(status)
             else:
-                st.markdown(f"**{t(status)}**")
+                st.markdown(f"**{status}**")
 
     with col3:
         with st.container(border=True):
             st.caption(t("Formulário"))
-            st.markdown(f"**{desvio.get('formulario_status') or '-'}**")
+            st.markdown(f"**{get_campo_traduzido(desvio, 'formulario_status')}**")
 
     with col4:
         with st.container(border=True):
             st.caption(t("Importância"))
-            importancia = desvio.get('importancia') or '-'
-            if importancia.lower() == 'major':
+            importancia = get_campo_traduzido(desvio, 'importancia')
+            if importancia.lower() in ['major', 'maior']:
                 st.error(importancia)
-            elif importancia.lower() == 'minor':
-                st.markdown(f"**{importancia}**")
             else:
                 st.markdown(f"**{importancia}**")
 
@@ -686,7 +925,7 @@ def exibir_detalhes_desvio(desvio):
     with col14:
         with st.container(border=True):
             st.caption(t("Recorrência"))
-            st.markdown(f"**{desvio.get('recorrencia') or '-'}**")
+            st.markdown(f"**{get_campo_traduzido(desvio, 'recorrencia')}**")
 
     with col15:
         with st.container(border=True):
@@ -696,7 +935,7 @@ def exibir_detalhes_desvio(desvio):
     with col16:
         with st.container(border=True):
             st.caption(t("Escopo"))
-            st.markdown(f"**{desvio.get('escopo') or '-'}**")
+            st.markdown(f"**{get_campo_traduzido(desvio, 'escopo')}**")
 
     st.write("")
 
@@ -716,7 +955,7 @@ def exibir_detalhes_desvio(desvio):
     with col19:
         with st.container(border=True):
             st.caption(t("Atendeu os prazos de reporte?"))
-            st.markdown(f"**{desvio.get('atendeu_prazos_report') or '-'}**")
+            st.markdown(f"**{get_campo_traduzido(desvio, 'atendeu_prazos_report')}**")
 
     st.divider()
 
@@ -805,7 +1044,7 @@ def exibir_detalhes_desvio(desvio):
     with col20:
         with st.container(border=True):
             st.caption(t("Formulário Arquivado (ISF e TMF)?"))
-            st.markdown(f"**{desvio.get('formulario_arquivado') or '-'}**")
+            st.markdown(f"**{get_campo_traduzido(desvio, 'formulario_arquivado')}**")
 
     with col21:
         with st.container(border=True):
@@ -893,13 +1132,18 @@ def lista_desvios_page():
     # Tabela de desvios
     df_display = pd.DataFrame(desvios)
 
+    # Usar colunas traduzidas (_en) baseado no idioma
+    lang = st.session_state.get("language", "pt")
+    col_status = "status_en" if lang == "en" and "status_en" in df_display.columns else "status"
+    col_importancia = "importancia_en" if lang == "en" and "importancia_en" in df_display.columns else "importancia"
+
     colunas_tabela = [
         "numero_desvio_estudo",
-        "status",
+        col_status,
         "participante",
         "centro",
         "visita",
-        "importancia",
+        col_importancia,
         "descricao_desvio",
     ]
 
@@ -984,7 +1228,7 @@ def secao_avaliacao(desvios: list, estudo_id: int):
                     else:
                         with st.spinner(t("Salvando avaliação...")):
                             sucesso, mensagem = salvar_avaliacao(
-                                desvio_id=desvio["id"],
+                                desvio=desvio,
                                 estudo_id=estudo_id,
                                 avaliacao=nova_avaliacao.strip(),
                                 row_version=desvio["row_version"],
@@ -1008,15 +1252,19 @@ def secao_avaliacao(desvios: list, estudo_id: int):
 def render_sidebar():
     """Renderiza a barra lateral com informações do usuário e navegação"""
     with st.sidebar:
-        # Seletor de idioma no topo
-        st.markdown(f"### 🌐 {t('Idioma')}")
-        idioma_opcoes = {"Português": "pt", "English": "en"}
+        # Seletor de idioma no topo com label traduzido
+        idioma_opcoes = {"🌐 Português": "pt", "🌐 English": "en"}
         idioma_atual = st.session_state.get("language", "pt")
+        opcao_atual = "🌐 Português" if idioma_atual == "pt" else "🌐 English"
+
+        # Label traduzido acima do selectbox
+        label_idioma = "Language" if idioma_atual == "en" else "Idioma"
+        st.markdown(f"**{label_idioma}**")
 
         novo_idioma = st.selectbox(
-            t("Idioma"),
+            label_idioma,
             options=list(idioma_opcoes.keys()),
-            index=list(idioma_opcoes.values()).index(idioma_atual),
+            index=list(idioma_opcoes.keys()).index(opcao_atual),
             label_visibility="collapsed",
             key="language_selector",
         )
